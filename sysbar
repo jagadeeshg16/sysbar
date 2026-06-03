@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+System Stats Indicator for Ubuntu Top Bar
+
+Top bar:  🟢/🟡/🔴  ↓/↑ speed  CPU%  RAM  Temp
+Click  :  progress bars, top RAM consumers, swap, network detail
+
+Dependencies (already present):
+  gir1.2-ayatanaappindicator3-0.1
+  gnome-shell-extension-appindicator
+
+Usage:
+  python3 ~/net-speed-indicator.py &
+"""
+
+import gi, time, subprocess, sys, glob, os, re
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib
+
+INDICATOR_LIB = None
+for _lib, _ver in [('AyatanaAppIndicator3', '0.1'), ('AppIndicator3', '0.1')]:
+    try:
+        gi.require_version(_lib, _ver)
+        exec(f"from gi.repository import {_lib} as AppIndicator3")
+        INDICATOR_LIB = _lib
+        break
+    except (ValueError, ImportError):
+        pass
+
+if INDICATOR_LIB is None:
+    print("ERROR: AppIndicator library not found.", file=sys.stderr)
+    sys.exit(1)
+
+INTERVAL_MS   = 1000
+TOP_PROC_COUNT = 5
+BAR_WIDTH      = 12   # chars in progress bar
+
+# ── thresholds ────────────────────────────────────────────────────────────────
+CPU_WARN,  CPU_CRIT  = 70,  90
+RAM_WARN,  RAM_CRIT  = 75,  90
+TEMP_WARN, TEMP_CRIT = 75,  85
+SWAP_WARN, SWAP_CRIT = 30,  60
+
+# ── colours (Pango hex) ───────────────────────────────────────────────────────
+C_NORMAL  = "#a8d8a8"   # soft green
+C_WARN    = "#ffcc66"   # amber
+C_CRIT    = "#ff6b6b"   # red
+C_DIM     = "#888888"   # grey
+C_TITLE   = "#aaaaff"   # light blue for section headers
+C_BAR_ON  = "#66bb6a"   # bar filled
+C_BAR_WARN= "#ffb74d"
+C_BAR_CRIT= "#ef5350"
+C_BAR_OFF = "#444444"   # bar empty
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def level(val, warn, crit):
+    """Return 'ok', 'warn', or 'crit'."""
+    if val >= crit: return 'crit'
+    if val >= warn: return 'warn'
+    return 'ok'
+
+def status_dot(lvl):
+    return {'ok': '🟢', 'warn': '🟡', 'crit': '🔴'}[lvl]
+
+def color_for(lvl):
+    return {'ok': C_NORMAL, 'warn': C_WARN, 'crit': C_CRIT}[lvl]
+
+def bar_color(lvl):
+    return {'ok': C_BAR_ON, 'warn': C_BAR_WARN, 'crit': C_BAR_CRIT}[lvl]
+
+def progress_bar(pct, lvl, width=BAR_WIDTH):
+    filled = max(0, min(width, round(pct / 100 * width)))
+    on  = '█' * filled
+    off = '░' * (width - filled)
+    bc  = bar_color(lvl)
+    return f'<span color="{bc}">{on}</span><span color="{C_BAR_OFF}">{off}</span>'
+
+def fmt_speed(bps):
+    bps = max(0, bps)
+    if bps >= 1_048_576: return f"{bps/1_048_576:.1f}M/s"
+    if bps >= 1_024:     return f"{bps/1_024:.0f}K/s"
+    return f"{bps:.0f}B/s"
+
+def fmt_bytes(b):
+    if b >= 1_073_741_824: return f"{b/1_073_741_824:.1f} GB"
+    if b >= 1_048_576:     return f"{b/1_048_576:.0f} MB"
+    return f"{b/1_024:.0f} KB"
+
+def fmt_ram_detail(used, total):
+    gib = 1024**3
+    return f"{used/gib:.1f} / {total/gib:.1f} GB"
+
+def fmt_swap_detail(used, total):
+    if total == 0: return "no swap"
+    gib = 1024**3
+    mib = 1024**2
+    if total >= gib: return f"{used/gib:.1f} / {total/gib:.1f} GB"
+    return f"{used/mib:.0f} / {total/mib:.0f} MB"
+
+
+# ── system reads ─────────────────────────────────────────────────────────────
+
+def read_net():
+    stats = {}
+    with open('/proc/net/dev') as f:
+        for line in f.readlines()[2:]:
+            if ':' not in line: continue
+            iface, data = line.split(':', 1)
+            fields = data.split()
+            if len(fields) >= 9:
+                stats[iface.strip()] = (int(fields[0]), int(fields[8]))
+    return stats
+
+def get_default_iface():
+    try:
+        out = subprocess.check_output(['ip','route','show','default'], text=True)
+        for line in out.splitlines():
+            if 'dev' in line:
+                parts = line.split()
+                return parts[parts.index('dev') + 1]
+    except Exception:
+        pass
+    return next((i for i in read_net() if i != 'lo'), None)
+
+def read_cpu_times():
+    with open('/proc/stat') as f:
+        vals = [int(x) for x in f.readline().split()[1:]]
+    idle  = vals[3] + vals[4]
+    return idle, sum(vals)
+
+def cpu_percent(pi, pt, ci, ct):
+    d = ct - pt
+    return 0.0 if d == 0 else 100.0 * (1.0 - (ci - pi) / d)
+
+def read_meminfo():
+    info = {}
+    with open('/proc/meminfo') as f:
+        for line in f:
+            if ':' not in line: continue
+            k, v = line.split(':', 1)
+            info[k.strip()] = int(v.split()[0]) * 1024
+    ram_used  = info['MemTotal'] - info.get('MemAvailable', info.get('MemFree', 0))
+    ram_total = info['MemTotal']
+    swap_used  = info.get('SwapTotal', 0) - info.get('SwapFree', 0)
+    swap_total = info.get('SwapTotal', 0)
+    return ram_used, ram_total, swap_used, swap_total
+
+def read_cpu_temp():
+    for zone in sorted(glob.glob('/sys/class/thermal/thermal_zone*/type')):
+        try:
+            if open(zone).read().strip() in ('x86_pkg_temp','TCPU','TCPU_PCI'):
+                return int(open(zone.replace('type','temp')).read().strip()) / 1000.0
+        except OSError:
+            pass
+    try:
+        paths = sorted(glob.glob('/sys/class/thermal/thermal_zone*/temp'))
+        return int(open(paths[0]).read().strip()) / 1000.0 if paths else None
+    except OSError:
+        return None
+
+def get_top_processes(n=TOP_PROC_COUNT):
+    procs = []
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit(): continue
+        try:
+            data  = open(f'/proc/{pid}/status').read()
+            name  = re.search(r'Name:\s+(\S+)', data).group(1)
+            vmrss = re.search(r'VmRSS:\s+(\d+)', data)
+            if vmrss:
+                procs.append((int(vmrss.group(1)) * 1024, name))
+        except (OSError, AttributeError):
+            pass
+    return sorted(procs, reverse=True)[:n]
+
+
+# ── menu item factories ───────────────────────────────────────────────────────
+
+def _markup_item(markup=''):
+    """Non-interactive menu item that displays Pango markup."""
+    item = Gtk.MenuItem()
+    item.set_sensitive(False)
+    lbl = Gtk.Label()
+    lbl.set_markup(markup)
+    lbl.set_halign(Gtk.Align.START)
+    lbl.set_use_markup(True)
+    item.add(lbl)
+    return item, lbl
+
+def _separator():
+    return Gtk.SeparatorMenuItem()
+
+def _section(title):
+    item, lbl = _markup_item(f'<span color="{C_TITLE}"><b>{title}</b></span>')
+    return item, lbl
+
+
+# ── indicator ────────────────────────────────────────────────────────────────
+
+class SystemIndicator:
+    def __init__(self):
+        self.iface    = get_default_iface()
+        self.prev_net = read_net()
+        self.prev_t   = time.monotonic()
+        self.prev_cpu = read_cpu_times()
+
+        self.ind = AppIndicator3.Indicator.new(          # noqa: F821
+            "system-stats-indicator",
+            "utilities-system-monitor",
+            AppIndicator3.IndicatorCategory.SYSTEM_SERVICES,  # noqa: F821
+        )
+        self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)  # noqa: F821
+        self.ind.set_label("loading…", "")
+
+        self._build_menu()
+        GLib.timeout_add(INTERVAL_MS, self._tick)
+
+    # ── menu build ────────────────────────────────────────────────────────────
+
+    def _build_menu(self):
+        menu = Gtk.Menu()
+
+        # Warning banner (hidden unless critical)
+        self._warn_item, self._warn_lbl = _markup_item('')
+        menu.append(self._warn_item)
+        self._warn_sep = _separator()
+        menu.append(self._warn_sep)
+
+        # ── System section ──
+        _, _ = _section("─── System ───")  # just for visual but unused var
+        hdr, _ = _section("─── System ───")
+        menu.append(hdr)
+
+        self._cpu_item,  self._cpu_lbl  = _markup_item()
+        self._ram_item,  self._ram_lbl  = _markup_item()
+        self._swap_item, self._swap_lbl = _markup_item()
+        self._temp_item, self._temp_lbl = _markup_item()
+        for item in (self._cpu_item, self._ram_item, self._swap_item, self._temp_item):
+            menu.append(item)
+
+        menu.append(_separator())
+
+        # ── Top processes ──
+        phdr, _ = _section("─── Top RAM consumers ───")
+        menu.append(phdr)
+        self._proc_items = []
+        self._proc_lbls  = []
+        for _ in range(TOP_PROC_COUNT):
+            item, lbl = _markup_item()
+            menu.append(item)
+            self._proc_items.append(item)
+            self._proc_lbls.append(lbl)
+
+        menu.append(_separator())
+
+        # ── Network ──
+        nhdr, _ = _section("─── Network ───")
+        menu.append(nhdr)
+        self._iface_item, self._iface_lbl = _markup_item()
+        self._down_item,  self._down_lbl  = _markup_item()
+        self._up_item,    self._up_lbl    = _markup_item()
+        for item in (self._iface_item, self._down_item, self._up_item):
+            menu.append(item)
+
+        menu.append(_separator())
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", lambda _: Gtk.main_quit())
+        menu.append(quit_item)
+
+        menu.show_all()
+        self._warn_item.hide()
+        self._warn_sep.hide()
+        self.ind.set_menu(menu)
+
+    # ── tick ──────────────────────────────────────────────────────────────────
+
+    def _tick(self):
+        now     = time.monotonic()
+        cur_net = read_net()
+        cur_cpu = read_cpu_times()
+        elapsed = now - self.prev_t
+
+        # ── network ──
+        down_bps = up_bps = 0.0
+        if elapsed > 0 and self.iface:
+            if self.iface not in cur_net:
+                self.iface = get_default_iface()
+            if self.iface and self.iface in cur_net and self.iface in self.prev_net:
+                p_rx, p_tx = self.prev_net[self.iface]
+                c_rx, c_tx = cur_net[self.iface]
+                down_bps = max(0, (c_rx - p_rx) / elapsed)
+                up_bps   = max(0, (c_tx - p_tx) / elapsed)
+
+        # ── CPU / RAM / Swap / Temp ──
+        cpu_pct                        = cpu_percent(*self.prev_cpu, *cur_cpu)
+        ram_used, ram_total, swap_used, swap_total = read_meminfo()
+        temp                           = read_cpu_temp()
+
+        ram_pct  = 100 * ram_used  / ram_total if ram_total else 0
+        swap_pct = 100 * swap_used / swap_total if swap_total else 0
+        temp_val = temp if temp is not None else 0
+
+        cpu_lvl  = level(cpu_pct,  CPU_WARN,  CPU_CRIT)
+        ram_lvl  = level(ram_pct,  RAM_WARN,  RAM_CRIT)
+        swap_lvl = level(swap_pct, SWAP_WARN, SWAP_CRIT)
+        temp_lvl = level(temp_val, TEMP_WARN, TEMP_CRIT)
+
+        worst = 'crit' if 'crit' in (cpu_lvl, ram_lvl, temp_lvl, swap_lvl) \
+           else 'warn' if 'warn' in (cpu_lvl, ram_lvl, temp_lvl, swap_lvl) \
+           else 'ok'
+
+        # ── top-bar label ──
+        temp_str = f"{temp_val:.0f}°C" if temp else "N/A"
+        label = (
+            f"{status_dot(worst)} "
+            f"↓{fmt_speed(down_bps)}  ↑{fmt_speed(up_bps)}"
+            f"  CPU {cpu_pct:.0f}%"
+            f"  RAM {ram_used/1024**3:.1f}G"
+            f"  {temp_str}"
+        )
+        self.ind.set_label(label, "")
+
+        # ── warning banner ──
+        if worst == 'crit':
+            msgs = []
+            if cpu_lvl  == 'crit': msgs.append("CPU")
+            if ram_lvl  == 'crit': msgs.append("RAM")
+            if temp_lvl == 'crit': msgs.append("TEMP")
+            if swap_lvl == 'crit': msgs.append("SWAP")
+            banner = f'  <span color="{C_CRIT}"><b>⚠  {" + ".join(msgs)} CRITICAL — close some apps!</b></span>'
+            self._warn_lbl.set_markup(banner)
+            self._warn_item.show()
+            self._warn_sep.show()
+        else:
+            self._warn_item.hide()
+            self._warn_sep.hide()
+
+        # ── system bars ──
+        def row(label, pct, lvl, detail):
+            bar   = progress_bar(pct, lvl)
+            col   = color_for(lvl)
+            pct_s = f"{pct:5.1f}%"
+            return (
+                f'<tt>  <span color="{col}"><b>{label}</b></span>  '
+                f'[{bar}]  '
+                f'<span color="{col}">{pct_s}</span>  '
+                f'<span color="{C_DIM}">{detail}</span></tt>'
+            )
+
+        self._cpu_lbl.set_markup(
+            row("CPU ", cpu_pct,  cpu_lvl,  ""))
+        self._ram_lbl.set_markup(
+            row("RAM ", ram_pct,  ram_lvl,  fmt_ram_detail(ram_used, ram_total)))
+        self._swap_lbl.set_markup(
+            row("SWAP", swap_pct, swap_lvl, fmt_swap_detail(swap_used, swap_total)))
+
+        temp_detail = f"{temp_val:.0f}°C" if temp else "N/A"
+        temp_pct    = min(100, temp_val / 100 * 100) if temp else 0
+        self._temp_lbl.set_markup(
+            row("TEMP", temp_pct, temp_lvl, temp_detail))
+
+        # ── top processes ──
+        procs = get_top_processes()
+        for i, lbl in enumerate(self._proc_lbls):
+            if i < len(procs):
+                mem, name = procs[i]
+                proc_lvl  = level(mem / ram_total * 100, 20, 40) if ram_total else 'ok'
+                col = color_for(proc_lvl)
+                lbl.set_markup(
+                    f'<tt>  <span color="{col}">{name[:18]:<18}</span>'
+                    f'  <span color="{C_DIM}">{fmt_bytes(mem):>8}</span></tt>'
+                )
+                self._proc_items[i].show()
+            else:
+                self._proc_items[i].hide()
+
+        # ── network ──
+        self._iface_lbl.set_markup(
+            f'<tt>  <span color="{C_DIM}">Interface  </span>'
+            f'<span color="{C_NORMAL}">{self.iface or "N/A"}</span></tt>')
+        self._down_lbl.set_markup(
+            f'<tt>  <span color="{C_DIM}">↓ Download </span>'
+            f'<span color="{C_NORMAL}">{fmt_speed(down_bps):>10}</span></tt>')
+        self._up_lbl.set_markup(
+            f'<tt>  <span color="{C_DIM}">↑ Upload   </span>'
+            f'<span color="{C_NORMAL}">{fmt_speed(up_bps):>10}</span></tt>')
+
+        self.prev_net = cur_net
+        self.prev_cpu = cur_cpu
+        self.prev_t   = now
+        return True
+
+
+# ── entry point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    indicator = SystemIndicator()
+    try:
+        Gtk.main()
+    except KeyboardInterrupt:
+        pass

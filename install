@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_DIR="/usr/local/bin"
+AUTOSTART_DIR="$HOME/.config/autostart"
+AUTOSTART_FILE="$AUTOSTART_DIR/sysbar.desktop"
+SCRIPT_PATH="$SCRIPT_DIR/sysbar"
+
+# Install dependencies
+echo "Checking dependencies..."
+python3 -c "import gi" 2>/dev/null || { echo "Installing python3-gi..."; sudo apt-get install -y python3-gi gir1.2-gtk-3.0; }
+dpkg -l gir1.2-ayatanaappindicator3-0.1 &>/dev/null || sudo apt-get install -y gir1.2-ayatanaappindicator3-0.1
+dpkg -l gnome-shell-extension-appindicator &>/dev/null || sudo apt-get install -y gnome-shell-extension-appindicator
+
+# Install command
+echo "Installing sysbar command..."
+sudo cp "$SCRIPT_PATH" "$INSTALL_DIR/sysbar"
+sudo chmod 755 "$INSTALL_DIR/sysbar"
+
+# Autostart
+echo "Setting up autostart..."
+mkdir -p "$AUTOSTART_DIR"
+cat > "$AUTOSTART_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Sysbar
+Comment=System stats in the top bar (CPU, RAM, temp, network)
+Exec=python3 $SCRIPT_PATH
+Icon=utilities-system-monitor
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
+EOF
+
+echo ""
+echo "Done!"
+echo "  Command:   sysbar"
+echo "  Autostart: $AUTOSTART_FILE"
+echo ""
+echo "Starting now..."
+pkill -f "sysbar" 2>/dev/null || true
+pkill -f "net-speed-indicator" 2>/dev/null || true
+DISPLAY=:1 nohup python3 "$SCRIPT_PATH" &>/dev/null &
+echo "Running! Check your top bar."
