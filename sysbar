@@ -43,6 +43,8 @@ SWAP_WARN, SWAP_CRIT = 30,  60
 
 # Hang alert: CPU must stay critical this many consecutive ticks before notifying
 CPU_SUSTAINED_TICKS = 5
+# Don't re-notify the same metric within this many seconds (even if it recovers and spikes again)
+NOTIFY_COOLDOWN_SECS = 600  # 10 minutes
 
 # ── colours (Pango hex) ───────────────────────────────────────────────────────
 C_NORMAL  = "#a8d8a8"   # soft green
@@ -216,10 +218,10 @@ class SystemIndicator:
         self.prev_t   = time.monotonic()
         self.prev_cpu = read_cpu_times()
 
-        # Alert state — tracks sustained ticks and whether metric is "notified"
-        # Once notified, won't fire again until metric recovers below WARN level
+        # Alert state — tracks sustained ticks and last notification timestamp per metric
+        # Won't re-notify the same metric within NOTIFY_COOLDOWN_SECS
         self._cpu_crit_ticks = 0
-        self._notified = {'cpu': False, 'ram': False, 'temp': False, 'swap': False}
+        self._last_notified = {'cpu': 0.0, 'ram': 0.0, 'temp': 0.0, 'swap': 0.0}
 
         self.ind = AppIndicator3.Indicator.new(          # noqa: F821
             "system-stats-indicator",
@@ -327,37 +329,32 @@ class SystemIndicator:
            else 'ok'
 
         # ── hang alerts ──
-        # CPU: only notify after sustained critical (avoids spikes)
+        def _can_notify(key):
+            return time.time() - self._last_notified[key] > NOTIFY_COOLDOWN_SECS
+
+        def _fire(key, title, body, urgency='critical'):
+            notify(title, body, urgency)
+            self._last_notified[key] = time.time()
+
+        # CPU: only notify after sustained critical (avoids brief spikes)
         if cpu_lvl == 'crit':
             self._cpu_crit_ticks += 1
-            if self._cpu_crit_ticks >= CPU_SUSTAINED_TICKS and not self._notified['cpu']:
-                notify('⚠ CPU Overloaded', f'CPU at {cpu_pct:.0f}% — system may hang. Close some apps.')
-                self._notified['cpu'] = True
+            if self._cpu_crit_ticks >= CPU_SUSTAINED_TICKS and _can_notify('cpu'):
+                _fire('cpu', '⚠ CPU Overloaded', f'CPU at {cpu_pct:.0f}% — system may hang. Close some apps.')
         else:
             self._cpu_crit_ticks = 0
-            if cpu_lvl == 'ok':
-                self._notified['cpu'] = False  # recovered, allow next alert
 
         # RAM: notify immediately on critical
-        if ram_lvl == 'crit' and not self._notified['ram']:
-            notify('⚠ RAM Critical', f'RAM at {ram_pct:.0f}% ({fmt_ram_detail(ram_used, ram_total)}) — system may hang.')
-            self._notified['ram'] = True
-        elif ram_lvl == 'ok':
-            self._notified['ram'] = False
+        if ram_lvl == 'crit' and _can_notify('ram'):
+            _fire('ram', '⚠ RAM Critical', f'RAM at {ram_pct:.0f}% ({fmt_ram_detail(ram_used, ram_total)}) — system may hang.')
 
         # Temp: notify immediately on critical
-        if temp and temp_lvl == 'crit' and not self._notified['temp']:
-            notify('⚠ CPU Overheating', f'Temperature at {temp_val:.0f}°C — check cooling.')
-            self._notified['temp'] = True
-        elif temp_lvl == 'ok':
-            self._notified['temp'] = False
+        if temp and temp_lvl == 'crit' and _can_notify('temp'):
+            _fire('temp', '⚠ CPU Overheating', f'Temperature at {temp_val:.0f}°C — check cooling.')
 
         # Swap: notify on critical
-        if swap_lvl == 'crit' and not self._notified['swap']:
-            notify('⚠ Swap Critical', f'Swap at {swap_pct:.0f}% — system is thrashing memory.', urgency='normal')
-            self._notified['swap'] = True
-        elif swap_lvl == 'ok':
-            self._notified['swap'] = False
+        if swap_lvl == 'crit' and _can_notify('swap'):
+            _fire('swap', '⚠ Swap Critical', f'Swap at {swap_pct:.0f}% — system is thrashing memory.', urgency='normal')
 
         # ── top-bar label ──
         temp_str = f"{temp_val:.0f}°C" if temp else "N/A"
