@@ -165,40 +165,15 @@ def read_cpu_temp():
     except OSError:
         return None
 
-def _proc_display_name(pid):
-    """Return a human-readable name: script basename for interpreters, else executable name."""
-    try:
-        cmdline = open(f'/proc/{pid}/cmdline').read().split('\x00')
-        cmdline = [c for c in cmdline if c]
-        if not cmdline:
-            return '?'
-        exe = os.path.basename(cmdline[0])
-        # For interpreters, use the script name instead
-        _GENERIC = {'server','main','app','index','run','start','worker','daemon'}
-        if exe in ('python3', 'python', 'node', 'java', 'ruby', 'perl', 'bash', 'sh'):
-            for arg in cmdline[1:]:
-                if not arg.startswith('-') and ('/' in arg or arg.endswith(('.py','.js','.rb','.pl','.sh'))):
-                    script = os.path.basename(arg)
-                    stem   = re.sub(r'\.(py|js|rb|pl|sh)$', '', script)
-                    if stem.lower() in _GENERIC:
-                        # use parent dir to disambiguate e.g. java-mcp/server
-                        parent = os.path.basename(os.path.dirname(arg))
-                        return f'{parent[:12]}/{stem}'[:20]
-                    return stem[:20]
-            return exe
-        return exe[:20]
-    except OSError:
-        return '?'
-
 def get_top_processes(n=TOP_PROC_COUNT):
     procs = []
     for pid in os.listdir('/proc'):
         if not pid.isdigit(): continue
         try:
             data  = open(f'/proc/{pid}/status').read()
+            name  = re.search(r'Name:\s+(\S+)', data).group(1)
             vmrss = re.search(r'VmRSS:\s+(\d+)', data)
             if vmrss:
-                name = _proc_display_name(int(pid))
                 procs.append((int(vmrss.group(1)) * 1024, name, int(pid)))
         except (OSError, AttributeError):
             pass
