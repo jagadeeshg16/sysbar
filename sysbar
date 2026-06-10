@@ -174,10 +174,26 @@ def get_top_processes(n=TOP_PROC_COUNT):
             name  = re.search(r'Name:\s+(\S+)', data).group(1)
             vmrss = re.search(r'VmRSS:\s+(\d+)', data)
             if vmrss:
-                procs.append((int(vmrss.group(1)) * 1024, name))
+                procs.append((int(vmrss.group(1)) * 1024, name, int(pid)))
         except (OSError, AttributeError):
             pass
     return sorted(procs, reverse=True)[:n]
+
+
+def confirm_kill(pid, name):
+    dialog = Gtk.MessageDialog(
+        message_type=Gtk.MessageType.WARNING,
+        buttons=Gtk.ButtonsType.YES_NO,
+        text=f'Kill "{name}"?',
+    )
+    dialog.format_secondary_text(f'Process will be terminated immediately (PID {pid}).')
+    response = dialog.run()
+    dialog.destroy()
+    if response == Gtk.ResponseType.YES:
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
 
 
 # ── menu item factories ───────────────────────────────────────────────────────
@@ -188,6 +204,15 @@ def _markup_item(markup=''):
     item.set_sensitive(False)
     lbl = Gtk.Label()
     lbl.set_markup(markup)
+    lbl.set_halign(Gtk.Align.START)
+    lbl.set_use_markup(True)
+    item.add(lbl)
+    return item, lbl
+
+def _proc_item():
+    """Clickable menu item for a process — can be connected to a kill handler."""
+    item = Gtk.MenuItem()
+    lbl = Gtk.Label()
     lbl.set_halign(Gtk.Align.START)
     lbl.set_use_markup(True)
     item.add(lbl)
@@ -262,13 +287,15 @@ class SystemIndicator:
         # ── Top processes ──
         phdr, _ = _section("─── Top RAM consumers ───")
         menu.append(phdr)
-        self._proc_items = []
-        self._proc_lbls  = []
+        self._proc_items    = []
+        self._proc_lbls     = []
+        self._proc_handlers = []   # signal handler IDs for disconnect/reconnect
         for _ in range(TOP_PROC_COUNT):
-            item, lbl = _markup_item()
+            item, lbl = _proc_item()
             menu.append(item)
             self._proc_items.append(item)
             self._proc_lbls.append(lbl)
+            self._proc_handlers.append(None)
 
         menu.append(_separator())
 
@@ -409,17 +436,30 @@ class SystemIndicator:
         # ── top processes ──
         procs = get_top_processes()
         for i, lbl in enumerate(self._proc_lbls):
+            item = self._proc_items[i]
+            # Disconnect old kill handler before reconnecting with new PID
+            if self._proc_handlers[i] is not None:
+                try:
+                    item.disconnect(self._proc_handlers[i])
+                except Exception:
+                    pass
+                self._proc_handlers[i] = None
+
             if i < len(procs):
-                mem, name = procs[i]
-                proc_lvl  = level(mem / ram_total * 100, 20, 40) if ram_total else 'ok'
+                mem, name, pid = procs[i]
+                proc_lvl = level(mem / ram_total * 100, 20, 40) if ram_total else 'ok'
                 col = color_for(proc_lvl)
                 lbl.set_markup(
-                    f'<tt>  <span color="{col}">{name[:18]:<18}</span>'
-                    f'  <span color="{C_DIM}">{fmt_bytes(mem):>8}</span></tt>'
+                    f'<tt>  <span color="{col}">{name[:16]:<16}</span>'
+                    f'  <span color="{C_DIM}">{fmt_bytes(mem):>8}</span>'
+                    f'  <span color="{C_DIM}">✕</span></tt>'
                 )
-                self._proc_items[i].show()
+                self._proc_handlers[i] = item.connect(
+                    'activate', lambda _, p=pid, n=name: confirm_kill(p, n)
+                )
+                item.show()
             else:
-                self._proc_items[i].hide()
+                item.hide()
 
         # ── network ──
         self._iface_lbl.set_markup(
