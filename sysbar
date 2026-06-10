@@ -38,13 +38,14 @@ BAR_WIDTH      = 12   # chars in progress bar
 # ── thresholds ────────────────────────────────────────────────────────────────
 CPU_WARN,  CPU_CRIT  = 70,  90
 RAM_WARN,  RAM_CRIT  = 75,  90
-TEMP_WARN, TEMP_CRIT = 75,  85
+TEMP_WARN, TEMP_CRIT = 80,  95
 SWAP_WARN, SWAP_CRIT = 30,  60
 
 # Hang alert: CPU must stay critical this many consecutive ticks before notifying
 CPU_SUSTAINED_TICKS = 5
 # Don't re-notify the same metric within this many seconds (even if it recovers and spikes again)
 NOTIFY_COOLDOWN_SECS = 1800  # 30 minutes
+NOTIFY_STATE_FILE    = os.path.expanduser('~/.sysbar-notify-state.json')
 
 # ── colours (Pango hex) ───────────────────────────────────────────────────────
 C_NORMAL  = "#a8d8a8"   # soft green
@@ -243,10 +244,13 @@ class SystemIndicator:
         self.prev_t   = time.monotonic()
         self.prev_cpu = read_cpu_times()
 
-        # Alert state — tracks sustained ticks and last notification timestamp per metric
-        # Won't re-notify the same metric within NOTIFY_COOLDOWN_SECS
+        # Alert state — persisted to disk so restarts don't reset the cooldown
         self._cpu_crit_ticks = 0
-        self._last_notified = {'cpu': 0.0, 'ram': 0.0, 'temp': 0.0, 'swap': 0.0}
+        try:
+            saved = json.load(open(NOTIFY_STATE_FILE))
+            self._last_notified = {k: float(saved.get(k, 0)) for k in ('cpu','ram','temp','swap')}
+        except Exception:
+            self._last_notified = {'cpu': 0.0, 'ram': 0.0, 'temp': 0.0, 'swap': 0.0}
 
         self.ind = AppIndicator3.Indicator.new(          # noqa: F821
             "system-stats-indicator",
@@ -362,6 +366,10 @@ class SystemIndicator:
         def _fire(key, title, body, urgency='critical'):
             notify(title, body, urgency)
             self._last_notified[key] = time.time()
+            try:
+                json.dump(self._last_notified, open(NOTIFY_STATE_FILE, 'w'))
+            except Exception:
+                pass
 
         # CPU: only notify after sustained critical (avoids brief spikes)
         if cpu_lvl == 'crit':
