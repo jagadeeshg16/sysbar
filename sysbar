@@ -44,7 +44,7 @@ SWAP_WARN, SWAP_CRIT = 30,  60
 # Hang alert: CPU must stay critical this many consecutive ticks before notifying
 CPU_SUSTAINED_TICKS = 5
 # Don't re-notify the same metric within this many seconds (even if it recovers and spikes again)
-NOTIFY_COOLDOWN_SECS = 600  # 10 minutes
+NOTIFY_COOLDOWN_SECS = 1800  # 30 minutes
 
 # ── colours (Pango hex) ───────────────────────────────────────────────────────
 C_NORMAL  = "#a8d8a8"   # soft green
