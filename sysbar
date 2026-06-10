@@ -41,8 +41,9 @@ RAM_WARN,  RAM_CRIT  = 75,  90
 TEMP_WARN, TEMP_CRIT = 80,  95
 SWAP_WARN, SWAP_CRIT = 30,  60
 
-# Hang alert: CPU must stay critical this many consecutive ticks before notifying
-CPU_SUSTAINED_TICKS = 5
+# Must stay critical for this many consecutive ticks before notifying (1 tick = 1 second)
+CPU_SUSTAINED_TICKS  = 5
+TEMP_SUSTAINED_TICKS = 10  # 10 seconds at critical temp before alerting
 # Don't re-notify the same metric within this many seconds (even if it recovers and spikes again)
 NOTIFY_COOLDOWN_SECS = 1800  # 30 minutes
 NOTIFY_STATE_FILE    = os.path.expanduser('~/.sysbar-notify-state.json')
@@ -245,7 +246,8 @@ class SystemIndicator:
         self.prev_cpu = read_cpu_times()
 
         # Alert state — persisted to disk so restarts don't reset the cooldown
-        self._cpu_crit_ticks = 0
+        self._cpu_crit_ticks  = 0
+        self._temp_crit_ticks = 0
         try:
             saved = json.load(open(NOTIFY_STATE_FILE))
             self._last_notified = {k: float(saved.get(k, 0)) for k in ('cpu','ram','temp','swap')}
@@ -383,9 +385,13 @@ class SystemIndicator:
         if ram_lvl == 'crit' and _can_notify('ram'):
             _fire('ram', '⚠ RAM Critical', f'RAM at {ram_pct:.0f}% ({fmt_ram_detail(ram_used, ram_total)}) — system may hang.')
 
-        # Temp: notify immediately on critical
-        if temp and temp_lvl == 'crit' and _can_notify('temp'):
-            _fire('temp', '⚠ CPU Overheating', f'Temperature at {temp_val:.0f}°C — check cooling.')
+        # Temp: only notify after sustained critical (spikes to 100°C are common under load)
+        if temp and temp_lvl == 'crit':
+            self._temp_crit_ticks += 1
+            if self._temp_crit_ticks >= TEMP_SUSTAINED_TICKS and _can_notify('temp'):
+                _fire('temp', '⚠ CPU Overheating', f'Temperature at {temp_val:.0f}°C for {TEMP_SUSTAINED_TICKS}s — check cooling.')
+        else:
+            self._temp_crit_ticks = 0
 
         # Swap: notify on critical
         if swap_lvl == 'crit' and _can_notify('swap'):
