@@ -385,13 +385,6 @@ class SystemIndicator:
         if ram_lvl == 'crit' and _can_notify('ram'):
             _fire('ram', '⚠ RAM Critical', f'RAM at {ram_pct:.0f}% ({fmt_ram_detail(ram_used, ram_total)}) — system may hang.')
 
-        # Temp: only notify after sustained critical (spikes to 100°C are common under load)
-        if temp and temp_lvl == 'crit':
-            self._temp_crit_ticks += 1
-            if self._temp_crit_ticks >= TEMP_SUSTAINED_TICKS and _can_notify('temp'):
-                _fire('temp', '⚠ CPU Overheating', f'Temperature at {temp_val:.0f}°C for {TEMP_SUSTAINED_TICKS}s — check cooling.')
-        else:
-            self._temp_crit_ticks = 0
 
         # Swap: notify on critical
         if swap_lvl == 'crit' and _can_notify('swap'):
